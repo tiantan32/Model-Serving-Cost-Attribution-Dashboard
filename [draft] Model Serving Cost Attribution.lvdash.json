@@ -1,0 +1,1699 @@
+{
+  "datasets" : [ {
+    "name" : "69ebd6fc",
+    "displayName" : "summary_master_dataset",
+    "query" : "-- CTE for pricing information\nWITH pricing AS (\n  select\n    pricing.effective_list.default as price,\n    price_start_time,\n    sku_name,\n    COALESCE(price_end_time, NOW()) as price_end_time\n  from\n    system.billing.list_prices p\n),\n\n-- CTE for usage data with user name extraction, serving details, and dollar calculation\nendpoint_usage AS (\nSELECT\n    u.record_id,\n    u.usage_quantity * price as dollar_cost,\n    --endpoint_name field was added in June 2024, previously it was null\n    IF(\n      u.usage_metadata.endpoint_name IS NULL,\n      'not populated',\n      u.usage_metadata.endpoint_name\n    ) AS endpoint_name,\n    u.usage_metadata.endpoint_id,\n    u.usage_quantity,\n    u.usage_start_time,\n    u.usage_end_time,\n    u.usage_date,\n    u.usage_type,\n    CASE\n      WHEN u.product_features.serving_type = \"FOUNDATION_MODEL\" AND u.product_features.model_serving.offering_type = \"BATCH_INFERENCE\" THEN \"BATCH_INFERENCE\"\n      WHEN u.product_features.serving_type = \"FOUNDATION_MODEL\" AND u.usage_type = \"TOKEN\" THEN \"PAY_PER_TOKEN\"\n      WHEN u.product_features.serving_type = \"FOUNDATION_MODEL\" AND u.usage_type = \"COMPUTE_TIME\" THEN \"PROVISIONED_THROUGHPUT\"\n      WHEN u.product_features.serving_type = \"MODEL\" THEN \"CPU_MODEL\"\n      ELSE u.product_features.serving_type\n    END AS serving_type,\n    u.custom_tags,\n    TRANSFORM(\n      MAP_KEYS(custom_tags),\n      (k, i) -> CONCAT(k, '=', MAP_VALUES(custom_tags) [i])\n    ) AS key_value_tags,\n    CASE \n      WHEN REGEXP_REPLACE(\n        u.identity_metadata.run_as,\n        '([a-zA-Z]+)\\\\.([a-zA-Z]+)@.*',\n        '$1 $2'\n      ) = u.identity_metadata.run_as THEN u.identity_metadata.run_as\n      ELSE INITCAP(\n        REGEXP_REPLACE(\n          u.identity_metadata.run_as,\n          '([a-zA-Z]+)\\\\.([a-zA-Z]+)@.*',\n          '$1 $2'\n        )\n      )\n    END AS user_name_cleaned,\n    u.account_id,\n    u.workspace_id,\n    w.workspace_name,\n    u.usage_metadata,\n    u.billing_origin_product\n  FROM\n    system.billing.usage u\n    INNER JOIN pricing p ON p.sku_name = u.sku_name\n    LEFT JOIN system.access.workspaces_latest w ON u.workspace_id = w.workspace_id\n    AND u.usage_start_time BETWEEN p.price_start_time AND p.price_end_time\n  WHERE\n    u.billing_origin_product = 'MODEL_SERVING'\n    AND usage_date BETWEEN :start_date AND :end_date\n    AND (\n      :tags = 'All'\n      OR array_contains(\n        TRANSFORM(\n          MAP_KEYS(custom_tags), (k, i) -> CONCAT(\n            lower(k),\n            '=',\n            lower(MAP_VALUES(custom_tags)[i])\n          )\n        ),\n        :tags\n      )\n    )\n),\n\n-- CTE to get top 10 endpoints by usage quantity\ntop_endpoints AS (\n  SELECT\n    account_id,\n    workspace_id,\n    endpoint_id,\n    SUM(dollar_cost) AS total_cost,\n    DENSE_RANK() OVER (ORDER BY SUM(dollar_cost) DESC) AS endpoint_cost_topN\n  FROM\n    endpoint_usage\n  GROUP BY\n    account_id, workspace_id, endpoint_id\n)\n\n-- Final query with grouping for top endpoints and users\nSELECT \n  uwn.record_id,\n  uwn.account_id,\n  uwn.workspace_id,\n  uwn.workspace_name,\n  uwn.usage_date,\n  uwn.usage_quantity,\n  uwn.key_value_tags,\n  uwn.custom_tags,\n  uwn.endpoint_id,\n  uwn.endpoint_name,\n  uwn.user_name_cleaned AS user,\n  uwn.usage_start_time, \n  uwn.usage_end_time,\n  TIMESTAMPDIFF(MINUTE, uwn.usage_start_time, uwn.usage_end_time) AS duration_minutes,\n  te.endpoint_cost_topN,\n  uwn.serving_type,\n  uwn.usage_quantity AS DBUs,\n  uwn.dollar_cost  -- Include dollar cost in the final output\nFROM endpoint_usage uwn\nINNER JOIN top_endpoints te \n  ON uwn.endpoint_id = te.endpoint_id\n  AND uwn.account_id = te.account_id\n  AND uwn.workspace_id = te.workspace_id\n\n\n",
+    "parameters" : [ {
+      "displayName" : "start_date",
+      "keyword" : "start_date",
+      "dataType" : "DATE",
+      "defaultSelection" : {
+        "values" : {
+          "dataType" : "DATE",
+          "values" : [ {
+            "value" : "now-30d/d"
+          } ]
+        }
+      }
+    }, {
+      "displayName" : "end_date",
+      "keyword" : "end_date",
+      "dataType" : "DATE",
+      "defaultSelection" : {
+        "values" : {
+          "dataType" : "DATE",
+          "values" : [ {
+            "value" : "2025-05-28T00:00:00.000"
+          } ]
+        }
+      }
+    }, {
+      "displayName" : "tags",
+      "keyword" : "tags",
+      "dataType" : "STRING",
+      "defaultSelection" : {
+        "values" : {
+          "dataType" : "STRING",
+          "values" : [ {
+            "value" : "All"
+          } ]
+        }
+      }
+    } ]
+  }, {
+    "name" : "3ac0c15e",
+    "displayName" : "request_details",
+    "query" : "-- CTE to fetch request details, including token counts and request time\nWITH latest_served_entities AS (\n  SELECT\n    *,\n    ROW_NUMBER() OVER (\n      PARTITION BY served_entity_id, endpoint_id, account_id, workspace_id\n      ORDER BY change_time DESC\n    ) AS rn\n  FROM\n    system.serving.served_entities\n  QUALIFY rn = 1\n), \n\nendpoint_metadata AS \n(\nSELECT \n  endpoint_id,\n  endpoint_name, \n  entity_type, \n  entity_name,\n  served_entity_name,\n  task, \n  endpoint_usage.account_id, \n  endpoint_usage.workspace_id, \n  w.workspace_name,\n  databricks_request_id,\n  CASE \n      WHEN requester NOT LIKE '%@%' then requester\n      WHEN REGEXP_REPLACE(\n        requester,\n        '([a-zA-Z]+)\\\\.([a-zA-Z]+)@.*',\n        '$1 $2'\n      ) = requester THEN requester\n      ELSE INITCAP(\n        REGEXP_REPLACE(\n          requester,\n          '([a-zA-Z]+)\\\\.([a-zA-Z]+)@.*',\n          '$1 $2'\n        )\n      )\n    END AS requester_name_cleaned,\n  endpoint_usage.input_token_count, \n  endpoint_usage.output_token_count, \n  (endpoint_usage.output_token_count + endpoint_usage.input_token_count) as total_token_count, \n  endpoint_usage.request_time  \nFROM system.serving.endpoint_usage AS endpoint_usage\nJOIN latest_served_entities as served_entities\nON served_entities.served_entity_id = endpoint_usage.served_entity_id\nLEFT JOIN system.access.workspaces_latest w ON served_entities.workspace_id = w.workspace_id\nWHERE \n DATE(endpoint_usage.request_time) BETWEEN :start_date AND :end_date\n),\n\n-- CTE to get top 10 users by usage quantity\ntop_users AS (\n  SELECT\n    account_id, \n    workspace_id,\n    endpoint_id,\n    requester_name_cleaned AS user,\n    SUM(total_token_count) AS total_tokens,\n    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT databricks_request_id) DESC) AS user_tokens_topN\n  FROM\n    endpoint_metadata\n  GROUP BY\n    account_id, \n    workspace_id,\n    endpoint_id,\n    requester_name_cleaned\n)\n\nSELECT em.*, \n  tu.user_tokens_topN\nFROM endpoint_metadata em\nINNER JOIN top_users tu\n  ON em.endpoint_id = tu.endpoint_id\n  AND em.account_id = tu.account_id\n  AND em.workspace_id = tu.workspace_id\n  AND em.requester_name_cleaned = tu.user",
+    "parameters" : [ {
+      "displayName" : "start_date",
+      "keyword" : "start_date",
+      "dataType" : "DATE",
+      "defaultSelection" : {
+        "values" : {
+          "dataType" : "DATE",
+          "values" : [ {
+            "value" : "2024-04-01T00:00:00.000"
+          } ]
+        }
+      }
+    }, {
+      "displayName" : "end_date",
+      "keyword" : "end_date",
+      "dataType" : "DATE",
+      "defaultSelection" : {
+        "values" : {
+          "dataType" : "DATE",
+          "values" : [ {
+            "value" : "2025-05-28T00:00:00.000"
+          } ]
+        }
+      }
+    } ]
+  }, {
+    "name" : "890d3156",
+    "displayName" : "Batch Inference Usage Data",
+    "query" : "WITH latest_warehouse_metadata AS (\n  SELECT *,\n   ROW_NUMBER() OVER (\n      PARTITION BY workspace_id, warehouse_id \n      ORDER BY change_time DESC\n      ) AS rn\n  FROM system.compute.warehouses w\n  QUALIFY rn = 1 -- Get more recent warehouse snapshot\n),\n\nlatest_pipeline_metadata AS (\n  SELECT\n    *,\n    ROW_NUMBER() OVER (\n      PARTITION BY workspace_id, pipeline_id \n      ORDER BY change_time DESC\n    ) AS rn\n  FROM\n    system.lakeflow.pipelines\n  QUALIFY rn = 1 -- Get more recent dlt snapshot\n  ),\n\nlatest_job_metadata AS (\n  SELECT\n    *,\n    ROW_NUMBER() OVER (\n      PARTITION BY workspace_id, job_id \n      ORDER BY change_time DESC\n    ) AS rn\n  FROM\n    system.lakeflow.jobs\n  QUALIFY rn = 1 -- Get more recent job snapshot\n),\n\nlatest_cluster_metadata AS (\n  SELECT\n    *,\n    ROW_NUMBER() OVER (\n      PARTITION BY workspace_id, cluster_id \n      ORDER BY change_time DESC\n    ) AS rn\n  FROM\n    system.compute.clusters\n  QUALIFY rn = 1 -- Get more recent cluster snapshot\n),\n\ndbsql_batch_inference_usage_data AS (\n  SELECT \n    u.account_id,\n    u.workspace_id,\n    u.record_id,\n    u.sku_name,\n    u.cloud,\n    u.usage_start_time,\n    u.usage_end_time,\n    u.usage_date,\n    u.custom_tags,\n    u.usage_unit,\n    u.usage_quantity,\n    u.usage_metadata,\n    u.identity_metadata.run_as AS user_email,\n    u.record_type,\n    u.ingestion_date,\n    u.billing_origin_product,\n    u.product_features,\n    u.usage_type,\n    'dbsql' AS executing_compute\n  FROM system.billing.usage u\n    JOIN latest_warehouse_metadata x\n      ON u.workspace_id = x.workspace_id\n      AND u.usage_metadata.warehouse_id = x.warehouse_id\n  WHERE u.billing_origin_product = 'MODEL_SERVING'\n    AND u.product_features.model_serving.offering_type = 'BATCH_INFERENCE'\n),\n\ndlt_batch_inference_usage_data AS (\n  SELECT \n    u.account_id,\n    u.workspace_id,\n    u.record_id,\n    u.sku_name,\n    u.cloud,\n    u.usage_start_time,\n    u.usage_end_time,\n    u.usage_date,\n    u.custom_tags,\n    u.usage_unit,\n    u.usage_quantity,\n    u.usage_metadata,\n    u.identity_metadata.run_as AS user_email,\n    u.record_type,\n    u.ingestion_date,\n    u.billing_origin_product,\n    u.product_features,\n    u.usage_type,\n    'dlt' AS executing_compute\n  FROM system.billing.usage u\n    JOIN latest_pipeline_metadata x\n      ON u.workspace_id = x.workspace_id\n      AND u.usage_metadata.dlt_pipeline_id = x.pipeline_id\n  WHERE u.billing_origin_product = 'MODEL_SERVING'\n    AND u.product_features.model_serving.offering_type = 'BATCH_INFERENCE'\n),\n\njobs_batch_inference_usage_data AS (\n  SELECT \n    u.account_id,\n    u.workspace_id,\n    u.record_id,\n    u.sku_name,\n    u.cloud,\n    u.usage_start_time,\n    u.usage_end_time,\n    u.usage_date,\n    u.custom_tags,\n    u.usage_unit,\n    u.usage_quantity,\n    u.usage_metadata,\n    u.identity_metadata.run_as AS user_email,\n    u.record_type,\n    u.ingestion_date,\n    u.billing_origin_product,\n    u.product_features,\n    u.usage_type,\n    'jobs' AS executing_compute\n  FROM system.billing.usage u\n    JOIN latest_job_metadata x\n      ON u.workspace_id = x.workspace_id\n      AND u.usage_metadata.job_id = x.job_id\n  WHERE u.billing_origin_product = 'MODEL_SERVING'\n    AND u.product_features.model_serving.offering_type = 'BATCH_INFERENCE'\n),\n\ncluster_batch_inference_usage_data AS (\n  SELECT \n    u.account_id,\n    u.workspace_id,\n    u.record_id,\n    u.sku_name,\n    u.cloud,\n    u.usage_start_time,\n    u.usage_end_time,\n    u.usage_date,\n    u.custom_tags,\n    u.usage_unit,\n    u.usage_quantity,\n    u.usage_metadata,\n    u.identity_metadata.run_as AS user_email,\n    u.record_type,\n    u.ingestion_date,\n    u.billing_origin_product,\n    u.product_features,\n    u.usage_type,\n    'all_purpose' AS executing_compute\n  FROM system.billing.usage u\n    JOIN latest_cluster_metadata x\n      ON u.workspace_id = x.workspace_id\n      AND u.usage_metadata.cluster_id = x.cluster_id\n  WHERE u.billing_origin_product = 'MODEL_SERVING'\n    AND u.product_features.model_serving.offering_type = 'BATCH_INFERENCE'\n    AND u.usage_metadata.job_id IS NULL\n    AND u.usage_metadata.dlt_pipeline_id IS NULL\n    AND u.usage_metadata.warehouse_id IS NULL \n),\n\nbatch_inference_usage_data AS (\nSELECT \n  account_id,\n  workspace_id,\n  record_id,\n  sku_name,\n  cloud,\n  usage_start_time,\n  usage_end_time,\n  usage_date,\n  custom_tags,\n  usage_unit,\n  usage_quantity,\n  usage_metadata,\n  user_email,\n  record_type,\n  ingestion_date,\n  billing_origin_product,\n  product_features,\n  usage_type,\n  executing_compute\nFROM dbsql_batch_inference_usage_data\nUNION ALL\nSELECT \n  account_id,\n  workspace_id,\n  record_id,\n  sku_name,\n  cloud,\n  usage_start_time,\n  usage_end_time,\n  usage_date,\n  custom_tags,\n  usage_unit,\n  usage_quantity,\n  usage_metadata,\n  user_email,\n  record_type,\n  ingestion_date,\n  billing_origin_product,\n  product_features,\n  usage_type,\n  executing_compute\nFROM dlt_batch_inference_usage_data\nUNION ALL\nSELECT \n  account_id,\n  workspace_id,\n  record_id,\n  sku_name,\n  cloud,\n  usage_start_time,\n  usage_end_time,\n  usage_date,\n  custom_tags,\n  usage_unit,\n  usage_quantity,\n  usage_metadata,\n  user_email,\n  record_type,\n  ingestion_date,\n  billing_origin_product,\n  product_features,\n  usage_type,\n  executing_compute\nFROM jobs_batch_inference_usage_data\nUNION ALL\nSELECT \n  account_id,\n  workspace_id,\n  record_id,\n  sku_name,\n  cloud,\n  usage_start_time,\n  usage_end_time,\n  usage_date,\n  custom_tags,\n  usage_unit,\n  usage_quantity,\n  usage_metadata,\n  user_email,\n  record_type,\n  ingestion_date,\n  billing_origin_product,\n  product_features,\n  usage_type,\n  executing_compute\nFROM cluster_batch_inference_usage_data\n),\n\n-- CTE to get top 10 users by usage quantity\ntop_users AS (\n  SELECT\n    account_id,\n    workspace_id,\n    user_email,\n    SUM(usage_quantity) AS total_usage_quantity,\n    DENSE_RANK() OVER (ORDER BY SUM(usage_quantity) DESC) AS user_usage_topN\n  FROM\n    batch_inference_usage_data\n  GROUP BY\n    account_id, workspace_id, user_email\n)\n\nSELECT uwn.*, tu.user_usage_topN \nFROM batch_inference_usage_data uwn\nINNER JOIN top_users tu \n  ON uwn.user_email = tu.user_email\n  AND uwn.account_id = tu.account_id\n  AND uwn.workspace_id = tu.workspace_id\n"
+  }, {
+    "name" : "cae4cb6b",
+    "displayName" : "Model Serving Token Usage Summary (L6M)",
+    "query" : "-- -- Per-Model Token Usage and Cost Breakdown\n-- -- Provides comprehensive analysis of token usage and estimated costs by model\n-- SELECT \n--     se.served_entity_name,\n--     se.entity_name as model_name,\n--     se.entity_type,\n--     COUNT(*) as total_requests,\n--     SUM(eu.input_token_count) as total_input_tokens,\n--     SUM(eu.output_token_count) as total_output_tokens,\n--     SUM(eu.input_token_count + eu.output_token_count) as total_tokens,\n--     AVG(eu.input_token_count) as avg_input_tokens_per_request,\n--     AVG(eu.output_token_count) as avg_output_tokens_per_request,\n    \n--     -- Calculate estimated costs based on billing usage table\n--     SUM(bu.usage_quantity) as total_dbus_consumed,\n    \n--     -- Cost per token calculations (approximate)\n--     CASE \n--         WHEN SUM(eu.input_token_count + eu.output_token_count) > 0 \n--         THEN SUM(bu.usage_quantity) / SUM(eu.input_token_count + eu.output_token_count) * 1000000\n--         ELSE NULL\n--     END as estimated_dbu_per_million_tokens,\n    \n--     DATE_TRUNC('day', eu.request_time) as usage_date\n    \n-- FROM system.serving.endpoint_usage eu\n-- JOIN system.serving.served_entities se \n--     ON eu.served_entity_id = se.served_entity_id\n-- LEFT JOIN system.billing.usage bu \n--     ON bu.usage_metadata.endpoint_name = se.endpoint_name\n--     AND bu.billing_origin_product = 'MODEL_SERVING'\n--     AND DATE(bu.usage_date) = DATE(eu.request_time)\n    \n-- WHERE eu.request_time BETWEEN :start_date AND :end_date\n--     AND eu.status_code = 200  -- Only successful requests\n    \n-- GROUP BY \n--     se.served_entity_name,\n--     se.entity_name,\n--     se.entity_type,\n--     DATE_TRUNC('day', eu.request_time)\n    \n-- ORDER BY total_tokens DESC, usage_date DESC;\n\nWITH goose_data AS (\n    SELECT \n         DATE(b.request_time) as dte, date_trunc('HOUR', b.request_time) as dte_hr, request_time, a.served_entity_name, a.endpoint_name, a.endpoint_id, b.*,\n         CASE\n         WHEN a.served_entity_name LIKE \"%-4%\"  AND a.served_entity_name LIKE \"%claud%\" THEN 'claude-4'\n         WHEN a.served_entity_name LIKE \"%3-7%\" THEN 'claude-3-7'\n         WHEN a.served_entity_name LIKE \"%3-5%\" THEN 'claude-3-5'\n         WHEN a.served_entity_name LIKE \"%gemini%\" THEN 'gemini'\n         WHEN a.served_entity_name LIKE \"%gemma\" THEN 'gemma'\n         WHEN a.served_entity_name LIKE \"%o1%\" OR a.served_entity_name LIKE \"%o4%\" OR a.served_entity_name LIKE \"%o2%\" OR  a.served_entity_name LIKE \"%gpt%\" THEN 'openai'\n         WHEN a.served_entity_name LIKE \"%llama%\" THEN 'llama'\n         ELSE \"other\"\n         END AS family\n    FROM system.serving.served_entities AS a\n    LEFT JOIN system.serving.endpoint_usage b \n        ON a.served_entity_id = b.served_entity_id\n     AND DATE(b.request_time) >= '2025-05-15')\n--SELECT dte_hr, entity_name, status_code, count(status_code) as num_occurences FROM goose_data group by all order by dte_hr, num_occurences desc\nSELECT date_trunc('DAY', dte) as mnth, family, sum(input_token_count + output_token_count) as total_tokens FROM goose_data group by ALL order by mnth desc"
+  }, {
+    "name" : "d1d931ca",
+    "displayName" : "AI Function Query History Dataset",
+    "query" : "WITH ai_query_history AS (\n  SELECT *, 'ai_query' AS ai_function_name\n  FROM system.query.history \n  WHERE statement_text LIKE '%ai_query%' \n    AND (statement_text LIKE '%databricks-meta-llama%' \n         OR statement_text LIKE '%databricks-claude%')\n    AND statement_type = 'SELECT'\n    AND statement_text NOT LIKE '%system generated%' \n    AND execution_status = 'FINISHED'\n),\nai_classify AS (\n  SELECT *, 'ai_classify' AS ai_function_name\n  FROM system.query.history \n  WHERE statement_text LIKE '%ai_classify%' \n    AND (statement_text LIKE '%databricks-meta-llama%' \n         OR statement_text LIKE '%databricks-claude%')\n    AND statement_type = 'SELECT'\n    AND statement_text NOT LIKE '%system generated%' \n    AND execution_status = 'FINISHED'\n),\nai_extract AS (\n  SELECT *, 'ai_extract' AS ai_function_name\n  FROM system.query.history \n  WHERE statement_text LIKE '%ai_extract%' \n    AND (statement_text LIKE '%databricks-meta-llama%' \n         OR statement_text LIKE '%databricks-claude%')\n    AND statement_type = 'SELECT'\n    AND statement_text NOT LIKE '%system generated%' \n    AND execution_status = 'FINISHED'\n),\nai_analyze_sentiment AS (\n  SELECT *, 'ai_analyze_sentiment' AS ai_function_name\n  FROM system.query.history \n  WHERE statement_text LIKE '%ai_analyze_sentiment%' \n    AND (statement_text LIKE '%databricks-meta-llama%' \n         OR statement_text LIKE '%databricks-claude%')\n    AND statement_type = 'SELECT'\n    AND statement_text NOT LIKE '%system generated%' \n    AND execution_status = 'FINISHED'\n),\nai_fix_grammar AS (\n  SELECT *, 'ai_fix_grammar' AS ai_function_name\n  FROM system.query.history \n  WHERE statement_text LIKE '%ai_fix_grammar%' \n    AND (statement_text LIKE '%databricks-meta-llama%' \n         OR statement_text LIKE '%databricks-claude%')\n    AND statement_type = 'SELECT'\n    AND statement_text NOT LIKE '%system generated%' \n    AND execution_status = 'FINISHED'\n),\nai_forecast AS (\n  SELECT *, 'ai_forecast' AS ai_function_name\n  FROM system.query.history \n  WHERE statement_text LIKE '%ai_forecast%' \n    AND (statement_text LIKE '%databricks-meta-llama%' \n         OR statement_text LIKE '%databricks-claude%')\n    AND statement_type = 'SELECT'\n    AND statement_text NOT LIKE '%system generated%' \n    AND execution_status = 'FINISHED'\n),\nai_gen AS (\n  SELECT *, 'ai_gen' AS ai_function_name\n  FROM system.query.history \n  WHERE statement_text LIKE '%ai_gen%' \n    AND (statement_text LIKE '%databricks-meta-llama%' \n         OR statement_text LIKE '%databricks-claude%')\n    AND statement_type = 'SELECT'\n    AND statement_text NOT LIKE '%system generated%' \n    AND execution_status = 'FINISHED'\n),\nai_generate_text AS (\n  SELECT *, 'ai_generate_text' AS ai_function_name\n  FROM system.query.history \n  WHERE statement_text LIKE '%ai_generate_text%' \n    AND (statement_text LIKE '%databricks-meta-llama%' \n         OR statement_text LIKE '%databricks-claude%')\n    AND statement_type = 'SELECT'\n    AND statement_text NOT LIKE '%system generated%' \n    AND execution_status = 'FINISHED'\n),\nai_mask AS (\n  SELECT *, 'ai_mask' AS ai_function_name\n  FROM system.query.history \n  WHERE statement_text LIKE '%ai_mask%' \n    AND (statement_text LIKE '%databricks-meta-llama%' \n         OR statement_text LIKE '%databricks-claude%')\n    AND statement_type = 'SELECT'\n    AND statement_text NOT LIKE '%system generated%' \n    AND execution_status = 'FINISHED'\n),\nai_similarity AS (\n  SELECT *, 'ai_similarity' AS ai_function_name\n  FROM system.query.history \n  WHERE statement_text LIKE '%ai_similarity%' \n    AND (statement_text LIKE '%databricks-meta-llama%' \n         OR statement_text LIKE '%databricks-claude%')\n    AND statement_type = 'SELECT'\n    AND statement_text NOT LIKE '%system generated%' \n    AND execution_status = 'FINISHED'\n),\nai_translate AS (\n  SELECT *, 'ai_translate' AS ai_function_name\n  FROM system.query.history \n  WHERE statement_text LIKE '%ai_translate%' \n    AND (statement_text LIKE '%databricks-meta-llama%' \n         OR statement_text LIKE '%databricks-claude%')\n    AND statement_type = 'SELECT'\n    AND statement_text NOT LIKE '%system generated%' \n    AND execution_status = 'FINISHED'\n),\nai_summarize AS (\n  SELECT *, 'ai_summarize' AS ai_function_name\n  FROM system.query.history \n  WHERE statement_text LIKE '%ai_summarize%' \n    AND (statement_text LIKE '%databricks-meta-llama%' \n         OR statement_text LIKE '%databricks-claude%')\n    AND statement_type = 'SELECT'\n    AND statement_text NOT LIKE '%system generated%' \n    AND execution_status = 'FINISHED'\n)\nSELECT * \nFROM ai_query_history\nUNION ALL\nSELECT * \nFROM ai_classify\nUNION ALL\nSELECT * \nFROM ai_extract\nUNION ALL\nSELECT * \nFROM ai_analyze_sentiment\nUNION ALL\nSELECT * \nFROM ai_fix_grammar\nUNION ALL\nSELECT * \nFROM ai_forecast\nUNION ALL\nSELECT * \nFROM ai_gen\nUNION ALL\nSELECT * \nFROM ai_generate_text\nUNION ALL\nSELECT * \nFROM ai_mask\nUNION ALL\nSELECT * \nFROM ai_similarity\nUNION ALL\nSELECT * \nFROM ai_translate\nUNION ALL\nSELECT * \nFROM ai_summarize"
+  }, {
+    "name" : "8f3e0f15",
+    "displayName" : "Batch Inference Model Serving Usage Report",
+    "query" : "-- SELECT *\n-- FROM system.billing.usage u\n--   JOIN system.compute.warehouses x\n--     ON u.workspace_id = x.workspace_id\n--     AND u.usage_metadata.warehouse_id = x.warehouse_id\n--   WHERE u.workspace_id = '1444828305810485'\n--     AND u.billing_origin_product = \"MODEL_SERVING\"\n--     AND u.product_features.model_serving.offering_type = \"BATCH_INFERENCE\"\n--     AND x.warehouse_id = '4b9b953939869799'\n--     AND u.identity_metadata.run_as = 'ashwin.srikant@databricks.com'"
+  } ],
+  "pages" : [ {
+    "name" : "1a75a1c1",
+    "displayName" : "Serving Summary",
+    "layout" : [ {
+      "widget" : {
+        "name" : "d81ef98d",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "fields" : [ {
+              "name" : "sum(dollar_cost)",
+              "expression" : "SUM(`dollar_cost`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 2,
+          "widgetType" : "counter",
+          "encodings" : {
+            "value" : {
+              "fieldName" : "sum(dollar_cost)",
+              "format" : {
+                "type" : "number-currency",
+                "currencyCode" : "USD",
+                "abbreviation" : "compact",
+                "decimalPlaces" : {
+                  "type" : "max",
+                  "places" : 1
+                }
+              },
+              "displayName" : "Sum of dollar_cost"
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Total Dollars Spent (List)"
+          }
+        }
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 2,
+        "width" : 1,
+        "height" : 3
+      }
+    }, {
+      "widget" : {
+        "name" : "568d1b09",
+        "queries" : [ {
+          "name" : "dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b7fa2d817a1bd9d6ecc775e94ee_workspace_name",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "fields" : [ {
+              "name" : "workspace_name",
+              "expression" : "`workspace_name`"
+            }, {
+              "name" : "workspace_name_associativity",
+              "expression" : "COUNT_IF(`associative_filter_predicate_group`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 2,
+          "widgetType" : "filter-single-select",
+          "encodings" : {
+            "fields" : [ {
+              "fieldName" : "workspace_name",
+              "displayName" : "workspace_name",
+              "queryName" : "dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b7fa2d817a1bd9d6ecc775e94ee_workspace_name"
+            } ]
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Workspaces"
+          }
+        }
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 0,
+        "width" : 2,
+        "height" : 2
+      }
+    }, {
+      "widget" : {
+        "name" : "423beb24",
+        "queries" : [ {
+          "name" : "parameter_dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b7fa2d817a1bd9d6ecc775e94ee_start_date",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "parameters" : [ {
+              "name" : "start_date",
+              "keyword" : "start_date"
+            } ],
+            "disaggregated" : false
+          }
+        }, {
+          "name" : "parameter_dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b823052197b8752819e8c306239_start_date",
+          "query" : {
+            "datasetName" : "3ac0c15e",
+            "parameters" : [ {
+              "name" : "start_date",
+              "keyword" : "start_date"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 2,
+          "widgetType" : "filter-date-picker",
+          "encodings" : {
+            "fields" : [ {
+              "parameterName" : "start_date",
+              "queryName" : "parameter_dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b7fa2d817a1bd9d6ecc775e94ee_start_date"
+            }, {
+              "parameterName" : "start_date",
+              "queryName" : "parameter_dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b823052197b8752819e8c306239_start_date"
+            } ]
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Date Range"
+          }
+        }
+      },
+      "position" : {
+        "x" : 2,
+        "y" : 0,
+        "width" : 1,
+        "height" : 2
+      }
+    }, {
+      "widget" : {
+        "name" : "e684ecd1",
+        "queries" : [ {
+          "name" : "parameter_dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b7fa2d817a1bd9d6ecc775e94ee_end_date",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "parameters" : [ {
+              "name" : "end_date",
+              "keyword" : "end_date"
+            } ],
+            "disaggregated" : false
+          }
+        }, {
+          "name" : "parameter_dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b823052197b8752819e8c306239_end_date",
+          "query" : {
+            "datasetName" : "3ac0c15e",
+            "parameters" : [ {
+              "name" : "end_date",
+              "keyword" : "end_date"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 2,
+          "widgetType" : "filter-date-picker",
+          "encodings" : {
+            "fields" : [ {
+              "parameterName" : "end_date",
+              "queryName" : "parameter_dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b7fa2d817a1bd9d6ecc775e94ee_end_date"
+            }, {
+              "parameterName" : "end_date",
+              "queryName" : "parameter_dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b823052197b8752819e8c306239_end_date"
+            } ]
+          },
+          "selection" : {
+            "defaultSelection" : {
+              "values" : {
+                "dataType" : "DATE",
+                "values" : [ {
+                  "value" : "now/d"
+                } ]
+              }
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "End Date"
+          }
+        }
+      },
+      "position" : {
+        "x" : 3,
+        "y" : 0,
+        "width" : 1,
+        "height" : 2
+      }
+    }, {
+      "widget" : {
+        "name" : "948b5962",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "fields" : [ {
+              "name" : "sum(usage_quantity)",
+              "expression" : "SUM(`usage_quantity`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 2,
+          "widgetType" : "counter",
+          "encodings" : {
+            "value" : {
+              "fieldName" : "sum(usage_quantity)",
+              "format" : {
+                "type" : "number-plain",
+                "abbreviation" : "compact",
+                "decimalPlaces" : {
+                  "type" : "max",
+                  "places" : 1
+                }
+              },
+              "displayName" : "Sum of usage_quantity"
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Total DBUs Consumed"
+          }
+        }
+      },
+      "position" : {
+        "x" : 4,
+        "y" : 2,
+        "width" : 1,
+        "height" : 3
+      }
+    }, {
+      "widget" : {
+        "name" : "e8de2940",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "3ac0c15e",
+            "fields" : [ {
+              "name" : "sum(total_token_count)",
+              "expression" : "SUM(`total_token_count`)"
+            }, {
+              "name" : "requester_name_cleaned",
+              "expression" : "`requester_name_cleaned`"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 3,
+          "widgetType" : "bar",
+          "encodings" : {
+            "x" : {
+              "fieldName" : "sum(total_token_count)",
+              "scale" : {
+                "type" : "quantitative"
+              },
+              "axis" : {
+                "hideTitle" : true
+              },
+              "displayName" : "Sum of total_token_count"
+            },
+            "y" : {
+              "fieldName" : "requester_name_cleaned",
+              "scale" : {
+                "type" : "categorical",
+                "sort" : {
+                  "by" : "x-reversed"
+                }
+              },
+              "axis" : {
+                "hideTitle" : true
+              },
+              "displayName" : "requester_name_cleaned"
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Top Users by Tokens [AI Gateway]"
+          }
+        }
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 19,
+        "width" : 2,
+        "height" : 8
+      }
+    }, {
+      "widget" : {
+        "name" : "ead10b3d",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "fields" : [ {
+              "name" : "sum(dollar_cost)",
+              "expression" : "SUM(`dollar_cost`)"
+            }, {
+              "name" : "endpoint_name",
+              "expression" : "`endpoint_name`"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 3,
+          "widgetType" : "bar",
+          "encodings" : {
+            "x" : {
+              "fieldName" : "sum(dollar_cost)",
+              "scale" : {
+                "type" : "quantitative"
+              },
+              "axis" : {
+                "hideTitle" : true
+              },
+              "format" : {
+                "type" : "number-currency",
+                "currencyCode" : "USD",
+                "abbreviation" : "compact",
+                "decimalPlaces" : {
+                  "type" : "max",
+                  "places" : 1
+                }
+              },
+              "displayName" : "Sum of dollar_cost"
+            },
+            "y" : {
+              "fieldName" : "endpoint_name",
+              "axis" : {
+                "hideTitle" : true
+              },
+              "scale" : {
+                "type" : "categorical",
+                "sort" : {
+                  "by" : "x-reversed"
+                }
+              },
+              "displayName" : "endpoint_name"
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Top Endpoints by Spend"
+          }
+        }
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 5,
+        "width" : 2,
+        "height" : 8
+      }
+    }, {
+      "widget" : {
+        "name" : "481a32e4",
+        "queries" : [ {
+          "name" : "dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b7fa2d817a1bd9d6ecc775e94ee_endpoint_name",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "fields" : [ {
+              "name" : "endpoint_name",
+              "expression" : "`endpoint_name`"
+            }, {
+              "name" : "endpoint_name_associativity",
+              "expression" : "COUNT_IF(`associative_filter_predicate_group`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 2,
+          "widgetType" : "filter-multi-select",
+          "encodings" : {
+            "fields" : [ {
+              "fieldName" : "endpoint_name",
+              "displayName" : "endpoint_name",
+              "queryName" : "dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b7fa2d817a1bd9d6ecc775e94ee_endpoint_name"
+            } ]
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Endpoint Name",
+            "showDescription" : false,
+            "description" : ""
+          }
+        }
+      },
+      "position" : {
+        "x" : 4,
+        "y" : 0,
+        "width" : 1,
+        "height" : 2
+      }
+    }, {
+      "widget" : {
+        "name" : "124c496f",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "fields" : [ {
+              "name" : "workspace_name",
+              "expression" : "`workspace_name`"
+            }, {
+              "name" : "weekly(usage_date)",
+              "expression" : "DATE_TRUNC(\"WEEK\", `usage_date`)"
+            }, {
+              "name" : "sum(dollar_cost)",
+              "expression" : "SUM(`dollar_cost`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 3,
+          "widgetType" : "bar",
+          "encodings" : {
+            "x" : {
+              "fieldName" : "weekly(usage_date)",
+              "scale" : {
+                "type" : "temporal"
+              },
+              "format" : {
+                "type" : "date",
+                "date" : "locale-short-month"
+              },
+              "axis" : {
+                "hideTitle" : true
+              },
+              "displayName" : "usage_date"
+            },
+            "y" : {
+              "fieldName" : "sum(dollar_cost)",
+              "scale" : {
+                "type" : "quantitative"
+              },
+              "format" : {
+                "type" : "number-currency",
+                "currencyCode" : "USD",
+                "abbreviation" : "compact",
+                "decimalPlaces" : {
+                  "type" : "max",
+                  "places" : 1
+                }
+              },
+              "axis" : {
+                "hideTitle" : true
+              },
+              "displayName" : "Sum of dollar_cost"
+            },
+            "color" : {
+              "fieldName" : "workspace_name",
+              "scale" : {
+                "type" : "categorical"
+              },
+              "displayName" : "workspace_name"
+            },
+            "label" : {
+              "show" : false
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Weekly Consumption by Workspace"
+          }
+        }
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 13,
+        "width" : 6,
+        "height" : 6
+      }
+    }, {
+      "widget" : {
+        "name" : "2110399e",
+        "queries" : [ {
+          "name" : "dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b7fa2d817a1bd9d6ecc775e94ee_endpoint_cost_topN",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "fields" : [ {
+              "name" : "min(endpoint_cost_topN)",
+              "expression" : "MIN(`endpoint_cost_topN`)"
+            }, {
+              "name" : "max(endpoint_cost_topN)",
+              "expression" : "MAX(`endpoint_cost_topN`)"
+            } ],
+            "disaggregated" : false
+          }
+        }, {
+          "name" : "dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b823052197b8752819e8c306239_user_tokens_topN",
+          "query" : {
+            "datasetName" : "3ac0c15e",
+            "fields" : [ {
+              "name" : "min(user_tokens_topN)",
+              "expression" : "MIN(`user_tokens_topN`)"
+            }, {
+              "name" : "max(user_tokens_topN)",
+              "expression" : "MAX(`user_tokens_topN`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 2,
+          "widgetType" : "range-slider",
+          "encodings" : {
+            "fields" : [ {
+              "fieldName" : "endpoint_cost_topN",
+              "displayName" : "endpoint_cost_topN",
+              "queryName" : "dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b7fa2d817a1bd9d6ecc775e94ee_endpoint_cost_topN"
+            }, {
+              "fieldName" : "user_tokens_topN",
+              "displayName" : "user_tokens_topN",
+              "queryName" : "dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b823052197b8752819e8c306239_user_tokens_topN"
+            } ]
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "TopK",
+            "showDescription" : true,
+            "description" : "Limit Top Analysis to first K"
+          }
+        }
+      },
+      "position" : {
+        "x" : 5,
+        "y" : 0,
+        "width" : 1,
+        "height" : 2
+      }
+    }, {
+      "widget" : {
+        "name" : "5b789138",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "3ac0c15e",
+            "fields" : [ {
+              "name" : "workspace_name",
+              "expression" : "`workspace_name`"
+            }, {
+              "name" : "weekly(request_time)",
+              "expression" : "DATE_TRUNC(\"WEEK\", `request_time`)"
+            }, {
+              "name" : "countdistinct(databricks_request_id)",
+              "expression" : "COUNT(DISTINCT `databricks_request_id`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 3,
+          "widgetType" : "bar",
+          "encodings" : {
+            "x" : {
+              "fieldName" : "weekly(request_time)",
+              "scale" : {
+                "type" : "temporal"
+              },
+              "axis" : {
+                "hideTitle" : true
+              },
+              "displayName" : "request_time"
+            },
+            "y" : {
+              "fieldName" : "countdistinct(databricks_request_id)",
+              "scale" : {
+                "type" : "quantitative"
+              },
+              "axis" : {
+                "hideTitle" : true
+              },
+              "displayName" : "Count of Unique databricks_request_id"
+            },
+            "color" : {
+              "fieldName" : "workspace_name",
+              "scale" : {
+                "type" : "categorical",
+                "mappings" : [ {
+                  "value" : "e2-field-eng-west",
+                  "color" : {
+                    "themeColorType" : "visualizationColors",
+                    "position" : 4
+                  }
+                } ]
+              },
+              "displayName" : "workspace_name"
+            },
+            "label" : {
+              "show" : false
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Weekly Trends: Number of Requests by Workspace [AI Gateway]"
+          }
+        }
+      },
+      "position" : {
+        "x" : 2,
+        "y" : 19,
+        "width" : 4,
+        "height" : 8
+      }
+    }, {
+      "widget" : {
+        "name" : "d90e1b72",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "fields" : [ {
+              "name" : "serving_type",
+              "expression" : "`serving_type`"
+            }, {
+              "name" : "daily(usage_date)",
+              "expression" : "DATE_TRUNC(\"DAY\", `usage_date`)"
+            }, {
+              "name" : "sum(dollar_cost)",
+              "expression" : "SUM(`dollar_cost`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 3,
+          "widgetType" : "bar",
+          "encodings" : {
+            "x" : {
+              "fieldName" : "daily(usage_date)",
+              "scale" : {
+                "type" : "temporal"
+              },
+              "axis" : {
+                "hideTitle" : true
+              },
+              "displayName" : "usage_date"
+            },
+            "y" : {
+              "fieldName" : "sum(dollar_cost)",
+              "scale" : {
+                "type" : "quantitative"
+              },
+              "format" : {
+                "type" : "number-currency",
+                "currencyCode" : "USD",
+                "abbreviation" : "compact",
+                "decimalPlaces" : {
+                  "type" : "max",
+                  "places" : 1
+                }
+              },
+              "axis" : {
+                "hideTitle" : true
+              },
+              "displayName" : "Sum of dollar_cost"
+            },
+            "color" : {
+              "fieldName" : "serving_type",
+              "scale" : {
+                "type" : "categorical"
+              },
+              "displayName" : "serving_type"
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Daily Consumption by Model Serving Type"
+          }
+        }
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 27,
+        "width" : 6,
+        "height" : 6
+      }
+    }, {
+      "widget" : {
+        "name" : "139da3c7",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "fields" : [ {
+              "name" : "endpoint_name",
+              "expression" : "`endpoint_name`"
+            }, {
+              "name" : "workspace_name",
+              "expression" : "`workspace_name`"
+            }, {
+              "name" : "serving_type",
+              "expression" : "`serving_type`"
+            }, {
+              "name" : "sum(dollar_cost)",
+              "expression" : "SUM(`dollar_cost`)"
+            } ],
+            "cubeGroupingSets" : {
+              "sets" : [ {
+                "fieldNames" : [ "endpoint_name", "workspace_name" ]
+              }, {
+                "fieldNames" : [ "serving_type" ]
+              } ]
+            },
+            "disaggregated" : false,
+            "orders" : [ {
+              "direction" : "ASC",
+              "expression" : "`endpoint_name`"
+            }, {
+              "direction" : "ASC",
+              "expression" : "`workspace_name`"
+            }, {
+              "direction" : "ASC",
+              "expression" : "`serving_type`"
+            } ]
+          }
+        } ],
+        "spec" : {
+          "version" : 3,
+          "widgetType" : "pivot",
+          "encodings" : {
+            "rows" : [ {
+              "fieldName" : "endpoint_name",
+              "displayTotal" : true,
+              "scale" : {
+                "type" : "categorical",
+                "sort" : {
+                  "by" : "cell-reversed",
+                  "field" : {
+                    "index" : 0
+                  }
+                }
+              },
+              "displayName" : "Endpoint Name"
+            }, {
+              "fieldName" : "workspace_name",
+              "displayName" : "Workspace Name"
+            } ],
+            "columns" : [ {
+              "fieldName" : "serving_type",
+              "scale" : {
+                "type" : "categorical",
+                "sort" : {
+                  "by" : "cell-reversed",
+                  "field" : {
+                    "index" : 0
+                  }
+                }
+              },
+              "displayTotal" : true,
+              "displayName" : "Model Serving Type"
+            } ],
+            "cell" : {
+              "type" : "multi-cell",
+              "fields" : [ {
+                "fieldName" : "sum(dollar_cost)",
+                "cellType" : "text",
+                "format" : {
+                  "type" : "number-currency",
+                  "currencyCode" : "USD",
+                  "abbreviation" : "none",
+                  "decimalPlaces" : {
+                    "type" : "exact",
+                    "places" : 1
+                  },
+                  "hideGroupSeparator" : true
+                },
+                "displayName" : "Dollar Cost"
+              } ]
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Top Endpoints: Detail View"
+          }
+        }
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 33,
+        "width" : 6,
+        "height" : 7
+      }
+    }, {
+      "widget" : {
+        "name" : "f4617390",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "fields" : [ {
+              "name" : "sum(dollar_cost)",
+              "expression" : "SUM(`dollar_cost`)"
+            }, {
+              "name" : "serving_type",
+              "expression" : "`serving_type`"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 3,
+          "widgetType" : "pie",
+          "encodings" : {
+            "angle" : {
+              "fieldName" : "sum(dollar_cost)",
+              "scale" : {
+                "type" : "quantitative"
+              },
+              "axis" : {
+                "hideTitle" : true
+              },
+              "format" : {
+                "type" : "number-currency",
+                "currencyCode" : "USD",
+                "abbreviation" : "compact",
+                "decimalPlaces" : {
+                  "type" : "max",
+                  "places" : 1
+                }
+              },
+              "displayName" : "Sum of dollar_cost"
+            },
+            "color" : {
+              "fieldName" : "serving_type",
+              "scale" : {
+                "type" : "categorical"
+              },
+              "displayName" : "serving_type"
+            },
+            "label" : {
+              "show" : true
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Serving Type Dollars Breakdown"
+          }
+        }
+      },
+      "position" : {
+        "x" : 4,
+        "y" : 5,
+        "width" : 2,
+        "height" : 8
+      }
+    }, {
+      "widget" : {
+        "name" : "529b42aa",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "fields" : [ {
+              "name" : "countdistinct(endpoint_id)",
+              "expression" : "COUNT(DISTINCT `endpoint_id`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 2,
+          "widgetType" : "counter",
+          "encodings" : {
+            "value" : {
+              "fieldName" : "countdistinct(endpoint_id)",
+              "format" : {
+                "type" : "number-plain",
+                "abbreviation" : "compact",
+                "decimalPlaces" : {
+                  "type" : "max",
+                  "places" : 2
+                }
+              },
+              "displayName" : "Count of Unique endpoint_id"
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Total Endpoint Count"
+          }
+        }
+      },
+      "position" : {
+        "x" : 5,
+        "y" : 2,
+        "width" : 1,
+        "height" : 3
+      }
+    }, {
+      "widget" : {
+        "name" : "272b357a",
+        "textbox_spec" : "## TODO\n\n- Top-line Batch $DBU spent, PT $DBU, PPT $DBU\n"
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 40,
+        "width" : 6,
+        "height" : 2
+      }
+    }, {
+      "widget" : {
+        "name" : "1e5f729b",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "3ac0c15e",
+            "fields" : [ {
+              "name" : "served_entity_name",
+              "expression" : "`served_entity_name`"
+            }, {
+              "name" : "sum(total_token_count)",
+              "expression" : "SUM(`total_token_count`)"
+            } ],
+            "cubeGroupingSets" : {
+              "sets" : [ {
+                "fieldNames" : [ "served_entity_name" ]
+              }, { } ]
+            },
+            "disaggregated" : false,
+            "orders" : [ {
+              "direction" : "ASC",
+              "expression" : "`served_entity_name`"
+            } ]
+          }
+        } ],
+        "spec" : {
+          "version" : 3,
+          "widgetType" : "pivot",
+          "encodings" : {
+            "rows" : [ {
+              "fieldName" : "served_entity_name",
+              "scale" : {
+                "type" : "categorical",
+                "sort" : {
+                  "by" : "cell-reversed",
+                  "field" : {
+                    "index" : 0
+                  }
+                }
+              },
+              "displayTotal" : true,
+              "displayName" : "Model"
+            } ],
+            "cell" : {
+              "type" : "multi-cell",
+              "fields" : [ {
+                "fieldName" : "sum(total_token_count)",
+                "cellType" : "text",
+                "style" : {
+                  "type" : "basic",
+                  "rules" : [ {
+                    "condition" : {
+                      "operator" : ">="
+                    },
+                    "backgroundColor" : "#00A972"
+                  } ]
+                },
+                "format" : {
+                  "type" : "number-plain",
+                  "abbreviation" : "compact",
+                  "decimalPlaces" : {
+                    "type" : "exact",
+                    "places" : 0
+                  },
+                  "hideGroupSeparator" : true
+                },
+                "displayName" : "Token Counts"
+              } ]
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Model Type Tokens Breakdown  [AI Gateway]"
+          }
+        }
+      },
+      "position" : {
+        "x" : 2,
+        "y" : 5,
+        "width" : 2,
+        "height" : 8
+      }
+    }, {
+      "widget" : {
+        "name" : "5ff32b48",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "d1d931ca",
+            "fields" : [ {
+              "name" : "ai_function_name",
+              "expression" : "`ai_function_name`"
+            }, {
+              "name" : "count(ai_function_name)",
+              "expression" : "COUNT(`ai_function_name`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 3,
+          "widgetType" : "bar",
+          "encodings" : {
+            "x" : {
+              "fieldName" : "ai_function_name",
+              "scale" : {
+                "type" : "categorical",
+                "sort" : {
+                  "by" : "y-reversed"
+                }
+              },
+              "displayName" : "Function Name"
+            },
+            "y" : {
+              "fieldName" : "count(ai_function_name)",
+              "scale" : {
+                "type" : "quantitative"
+              },
+              "displayName" : "Number of Queries"
+            }
+          },
+          "frame" : {
+            "title" : "Histogram of ai_function_name",
+            "showTitle" : true
+          }
+        }
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 42,
+        "width" : 6,
+        "height" : 6
+      }
+    }, {
+      "widget" : {
+        "name" : "2241b8e4",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "fields" : [ {
+              "name" : "sum(dollar_cost)",
+              "expression" : "SUM(`dollar_cost`)"
+            } ],
+            "filters" : [ {
+              "expression" : "`serving_type` IN ('BATCH_INFERENCE')"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 2,
+          "widgetType" : "counter",
+          "encodings" : {
+            "value" : {
+              "fieldName" : "sum(dollar_cost)",
+              "format" : {
+                "type" : "number-currency",
+                "currencyCode" : "USD",
+                "abbreviation" : "compact",
+                "decimalPlaces" : {
+                  "type" : "max",
+                  "places" : 1
+                }
+              },
+              "displayName" : "Sum of dollar_cost"
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "showDescription" : false,
+            "title" : "Batch Inference Spent (List)"
+          }
+        }
+      },
+      "position" : {
+        "x" : 1,
+        "y" : 2,
+        "width" : 1,
+        "height" : 3
+      }
+    }, {
+      "widget" : {
+        "name" : "46948406",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "fields" : [ {
+              "name" : "sum(dollar_cost)",
+              "expression" : "SUM(`dollar_cost`)"
+            } ],
+            "filters" : [ {
+              "expression" : "`serving_type` IN ('PROVISIONED_THROUGHPUT')"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 2,
+          "widgetType" : "counter",
+          "encodings" : {
+            "value" : {
+              "fieldName" : "sum(dollar_cost)",
+              "format" : {
+                "type" : "number-currency",
+                "currencyCode" : "USD",
+                "abbreviation" : "compact",
+                "decimalPlaces" : {
+                  "type" : "max",
+                  "places" : 1
+                }
+              },
+              "displayName" : "Sum of dollar_cost"
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Provisioned Throughput Spent (List)"
+          }
+        }
+      },
+      "position" : {
+        "x" : 2,
+        "y" : 2,
+        "width" : 1,
+        "height" : 3
+      }
+    }, {
+      "widget" : {
+        "name" : "cb68d535",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "fields" : [ {
+              "name" : "sum(dollar_cost)",
+              "expression" : "SUM(`dollar_cost`)"
+            } ],
+            "filters" : [ {
+              "expression" : "`serving_type` IN ('PAY_PER_TOKEN')"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 2,
+          "widgetType" : "counter",
+          "encodings" : {
+            "value" : {
+              "fieldName" : "sum(dollar_cost)",
+              "format" : {
+                "type" : "number-currency",
+                "currencyCode" : "USD",
+                "abbreviation" : "compact",
+                "decimalPlaces" : {
+                  "type" : "max",
+                  "places" : 1
+                }
+              },
+              "displayName" : "Sum of dollar_cost"
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Pay-Per-Token Spent (List)"
+          }
+        }
+      },
+      "position" : {
+        "x" : 3,
+        "y" : 2,
+        "width" : 1,
+        "height" : 3
+      }
+    } ],
+    "pageType" : "PAGE_TYPE_CANVAS"
+  }, {
+    "name" : "092ef76f",
+    "displayName" : "Global Filters",
+    "pageType" : "PAGE_TYPE_GLOBAL_FILTERS"
+  }, {
+    "name" : "be3e20f8",
+    "displayName" : "Pay-Per-Token",
+    "layout" : [ {
+      "widget" : {
+        "name" : "fbe1b77f",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "cae4cb6b",
+            "fields" : [ {
+              "name" : "family",
+              "expression" : "`family`"
+            }, {
+              "name" : "monthly(mnth)",
+              "expression" : "DATE_TRUNC(\"MONTH\", `mnth`)"
+            }, {
+              "name" : "sum(total_tokens)",
+              "expression" : "SUM(`total_tokens`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 3,
+          "widgetType" : "bar",
+          "encodings" : {
+            "x" : {
+              "fieldName" : "monthly(mnth)",
+              "scale" : {
+                "type" : "temporal"
+              },
+              "displayName" : "mnth"
+            },
+            "y" : {
+              "fieldName" : "sum(total_tokens)",
+              "scale" : {
+                "type" : "quantitative"
+              },
+              "displayName" : "Sum of total_tokens"
+            },
+            "color" : {
+              "fieldName" : "family",
+              "scale" : {
+                "type" : "categorical"
+              },
+              "displayName" : "family"
+            }
+          }
+        }
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 0,
+        "width" : 3,
+        "height" : 9
+      }
+    } ],
+    "pageType" : "PAGE_TYPE_CANVAS"
+  }, {
+    "name" : "14a3e693",
+    "displayName" : "Provisioned Throughput",
+    "pageType" : "PAGE_TYPE_CANVAS"
+  }, {
+    "name" : "1b1d01f3",
+    "displayName" : "Batch Inference",
+    "layout" : [ {
+      "widget" : {
+        "name" : "34456c13",
+        "queries" : [ {
+          "name" : "dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f0402a195a163eb31d88b922baeffb_workspace_id",
+          "query" : {
+            "datasetName" : "890d3156",
+            "fields" : [ {
+              "name" : "workspace_id",
+              "expression" : "`workspace_id`"
+            }, {
+              "name" : "workspace_id_associativity",
+              "expression" : "COUNT_IF(`associative_filter_predicate_group`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 2,
+          "widgetType" : "filter-multi-select",
+          "encodings" : {
+            "fields" : [ {
+              "fieldName" : "workspace_id",
+              "displayName" : "workspace_id",
+              "queryName" : "dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f0402a195a163eb31d88b922baeffb_workspace_id"
+            } ]
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Workspaces"
+          }
+        }
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 0,
+        "width" : 2,
+        "height" : 2
+      }
+    }, {
+      "widget" : {
+        "name" : "f307a69c",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "890d3156",
+            "fields" : [ {
+              "name" : "usage_date",
+              "expression" : "`usage_date`"
+            }, {
+              "name" : "sum(usage_quantity)",
+              "expression" : "SUM(`usage_quantity`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 3,
+          "widgetType" : "bar",
+          "encodings" : {
+            "x" : {
+              "fieldName" : "usage_date",
+              "scale" : {
+                "type" : "temporal"
+              },
+              "displayName" : "usage_date"
+            },
+            "y" : {
+              "fieldName" : "sum(usage_quantity)",
+              "scale" : {
+                "type" : "quantitative"
+              },
+              "displayName" : "DBUs"
+            }
+          },
+          "frame" : {
+            "title" : "Batch Inference Usage Over Time",
+            "showTitle" : true
+          }
+        }
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 2,
+        "width" : 3,
+        "height" : 6
+      }
+    }, {
+      "widget" : {
+        "name" : "e937aab0",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "890d3156",
+            "fields" : [ {
+              "name" : "executing_compute",
+              "expression" : "`executing_compute`"
+            }, {
+              "name" : "sum(usage_quantity)",
+              "expression" : "SUM(`usage_quantity`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 3,
+          "widgetType" : "bar",
+          "encodings" : {
+            "x" : {
+              "fieldName" : "executing_compute",
+              "scale" : {
+                "type" : "categorical",
+                "sort" : {
+                  "by" : "y-reversed"
+                }
+              },
+              "displayName" : "executing_compute"
+            },
+            "y" : {
+              "fieldName" : "sum(usage_quantity)",
+              "scale" : {
+                "type" : "quantitative"
+              },
+              "displayName" : "DBUs"
+            }
+          },
+          "frame" : {
+            "title" : "Batch Inference Usage by Executing Compute",
+            "showTitle" : true
+          }
+        }
+      },
+      "position" : {
+        "x" : 3,
+        "y" : 2,
+        "width" : 3,
+        "height" : 6
+      }
+    }, {
+      "widget" : {
+        "name" : "4189efc8",
+        "queries" : [ {
+          "name" : "parameter_dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b7fa2d817a1bd9d6ecc775e94ee_start_date",
+          "query" : {
+            "datasetName" : "69ebd6fc",
+            "parameters" : [ {
+              "name" : "start_date",
+              "keyword" : "start_date"
+            } ],
+            "disaggregated" : false
+          }
+        }, {
+          "name" : "parameter_dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b823052197b8752819e8c306239_start_date",
+          "query" : {
+            "datasetName" : "3ac0c15e",
+            "parameters" : [ {
+              "name" : "start_date",
+              "keyword" : "start_date"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 2,
+          "widgetType" : "filter-date-range-picker",
+          "encodings" : {
+            "fields" : [ {
+              "parameterName" : "start_date",
+              "queryName" : "parameter_dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b7fa2d817a1bd9d6ecc775e94ee_start_date"
+            }, {
+              "parameterName" : "start_date",
+              "queryName" : "parameter_dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f03b823052197b8752819e8c306239_start_date"
+            } ]
+          },
+          "frame" : {
+            "showTitle" : true,
+            "title" : "Date Range"
+          }
+        }
+      },
+      "position" : {
+        "x" : 2,
+        "y" : 0,
+        "width" : 2,
+        "height" : 2
+      }
+    }, {
+      "widget" : {
+        "name" : "95cc9d26",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "890d3156",
+            "fields" : [ {
+              "name" : "cloud",
+              "expression" : "`cloud`"
+            }, {
+              "name" : "sum(usage_quantity)",
+              "expression" : "SUM(`usage_quantity`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 3,
+          "widgetType" : "bar",
+          "encodings" : {
+            "x" : {
+              "fieldName" : "cloud",
+              "scale" : {
+                "type" : "categorical",
+                "sort" : {
+                  "by" : "y-reversed"
+                }
+              },
+              "displayName" : "cloud"
+            },
+            "y" : {
+              "fieldName" : "sum(usage_quantity)",
+              "scale" : {
+                "type" : "quantitative"
+              },
+              "displayName" : "DBUs"
+            }
+          },
+          "frame" : {
+            "title" : "Batch Inference Usage by Cloud",
+            "showTitle" : true
+          }
+        }
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 8,
+        "width" : 3,
+        "height" : 6
+      }
+    }, {
+      "widget" : {
+        "name" : "adcebfac",
+        "queries" : [ {
+          "name" : "main_query",
+          "query" : {
+            "datasetName" : "890d3156",
+            "fields" : [ {
+              "name" : "user_email",
+              "expression" : "`user_email`"
+            }, {
+              "name" : "sum(usage_quantity)",
+              "expression" : "SUM(`usage_quantity`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 3,
+          "widgetType" : "bar",
+          "encodings" : {
+            "x" : {
+              "fieldName" : "user_email",
+              "scale" : {
+                "type" : "categorical",
+                "sort" : {
+                  "by" : "y-reversed"
+                }
+              },
+              "displayName" : "User"
+            },
+            "y" : {
+              "fieldName" : "sum(usage_quantity)",
+              "scale" : {
+                "type" : "quantitative"
+              },
+              "displayName" : "DBUs"
+            }
+          },
+          "frame" : {
+            "title" : "Batch Inference Usage by run_as",
+            "showTitle" : true
+          }
+        }
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 14,
+        "width" : 6,
+        "height" : 6
+      }
+    }, {
+      "widget" : {
+        "name" : "d1ebe609",
+        "textbox_spec" : ""
+      },
+      "position" : {
+        "x" : 0,
+        "y" : 20,
+        "width" : 6,
+        "height" : 2
+      }
+    }, {
+      "widget" : {
+        "name" : "5bc881eb",
+        "queries" : [ {
+          "name" : "dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f0402a195a163eb31d88b922baeffb_user_usage_topN",
+          "query" : {
+            "datasetName" : "890d3156",
+            "fields" : [ {
+              "name" : "min(user_usage_topN)",
+              "expression" : "MIN(`user_usage_topN`)"
+            }, {
+              "name" : "max(user_usage_topN)",
+              "expression" : "MAX(`user_usage_topN`)"
+            } ],
+            "disaggregated" : false
+          }
+        } ],
+        "spec" : {
+          "version" : 2,
+          "widgetType" : "range-slider",
+          "encodings" : {
+            "fields" : [ {
+              "fieldName" : "user_usage_topN",
+              "displayName" : "user_usage_topN",
+              "queryName" : "dashboards/01f03b7f9cd31dea9209dace0bc1f8b1/datasets/01f0402a195a163eb31d88b922baeffb_user_usage_topN"
+            } ]
+          },
+          "selection" : {
+            "defaultSelection" : {
+              "range" : {
+                "dataType" : "INTEGER",
+                "min" : {
+                  "value" : ""
+                },
+                "max" : {
+                  "value" : "20"
+                }
+              }
+            }
+          },
+          "frame" : {
+            "showTitle" : true,
+            "showDescription" : true,
+            "title" : "TopK"
+          }
+        }
+      },
+      "position" : {
+        "x" : 4,
+        "y" : 0,
+        "width" : 2,
+        "height" : 2
+      }
+    } ],
+    "pageType" : "PAGE_TYPE_CANVAS"
+  } ]
+}
