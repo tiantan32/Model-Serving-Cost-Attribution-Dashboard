@@ -43,7 +43,7 @@
   }, {
     "name" : "3ac0c15e",
     "displayName" : "request_details",
-    "query" : "-- CTE to fetch request details, including token counts and request time\nWITH latest_served_entities AS (\n  SELECT\n    *,\n    ROW_NUMBER() OVER (\n      PARTITION BY served_entity_id, endpoint_id, account_id, workspace_id\n      ORDER BY change_time DESC\n    ) AS rn\n  FROM\n    system.serving.served_entities\n  QUALIFY rn = 1\n), \n\nendpoint_metadata AS \n(\nSELECT \n  endpoint_id,\n  endpoint_name, \n  entity_type, \n  entity_name,\n  served_entity_name,\n  task, \n  endpoint_usage.account_id, \n  endpoint_usage.workspace_id, \n  w.workspace_name,\n  databricks_request_id,\n  CASE \n      WHEN requester NOT LIKE '%@%' then requester\n      WHEN REGEXP_REPLACE(\n        requester,\n        '([a-zA-Z]+)\\\\.([a-zA-Z]+)@.*',\n        '$1 $2'\n      ) = requester THEN requester\n      ELSE INITCAP(\n        REGEXP_REPLACE(\n          requester,\n          '([a-zA-Z]+)\\\\.([a-zA-Z]+)@.*',\n          '$1 $2'\n        )\n      )\n    END AS requester_name_cleaned,\n  endpoint_usage.input_token_count, \n  endpoint_usage.output_token_count, \n  (endpoint_usage.output_token_count + endpoint_usage.input_token_count) as total_token_count, \n  endpoint_usage.request_time  \nFROM system.serving.endpoint_usage AS endpoint_usage\nJOIN latest_served_entities as served_entities\nON served_entities.served_entity_id = endpoint_usage.served_entity_id\nLEFT JOIN system.access.workspaces_latest w ON served_entities.workspace_id = w.workspace_id\nWHERE \n DATE(endpoint_usage.request_time) BETWEEN :start_date AND :end_date\n),\n\n-- CTE to get top 10 users by usage quantity\ntop_users AS (\n  SELECT\n    account_id, \n    workspace_id,\n    endpoint_id,\n    requester_name_cleaned AS user,\n    SUM(total_token_count) AS total_tokens,\n    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT databricks_request_id) DESC) AS user_tokens_topN\n  FROM\n    endpoint_metadata\n  GROUP BY\n    account_id, \n    workspace_id,\n    endpoint_id,\n    requester_name_cleaned\n)\n\nSELECT em.*, \n  tu.user_tokens_topN\nFROM endpoint_metadata em\nINNER JOIN top_users tu\n  ON em.endpoint_id = tu.endpoint_id\n  AND em.account_id = tu.account_id\n  AND em.workspace_id = tu.workspace_id\n  AND em.requester_name_cleaned = tu.user",
+    "query" : "-- CTE to fetch request details, including token counts and request time\nWITH latest_served_entities AS (\n  SELECT\n    *,\n    ROW_NUMBER() OVER (\n      PARTITION BY served_entity_id, endpoint_id, account_id, workspace_id\n      ORDER BY change_time DESC\n    ) AS rn\n  FROM\n    system.serving.served_entities\n  QUALIFY rn = 1\n), \n\nendpoint_metadata AS \n(\nSELECT \n  endpoint_id,\n  endpoint_name, \n  entity_type, \n  entity_name,\n  served_entity_name,\n  task, \n  endpoint_usage.account_id, \n  endpoint_usage.workspace_id, \n  w.workspace_name,\n  databricks_request_id,\n  CASE \n      WHEN requester NOT LIKE '%@%' then requester\n      WHEN REGEXP_REPLACE(\n        requester,\n        '([a-zA-Z]+)\\\\.([a-zA-Z]+)@.*',\n        '$1 $2'\n      ) = requester THEN requester\n      ELSE INITCAP(\n        REGEXP_REPLACE(\n          requester,\n          '([a-zA-Z]+)\\\\.([a-zA-Z]+)@.*',\n          '$1 $2'\n        )\n      )\n    END AS requester_name_cleaned,\n  endpoint_usage.input_token_count, \n  endpoint_usage.output_token_count, \n  (endpoint_usage.output_token_count + endpoint_usage.input_token_count) as total_token_count, \n  endpoint_usage.request_time  \nFROM system.serving.endpoint_usage AS endpoint_usage\nJOIN latest_served_entities as served_entities\nON served_entities.served_entity_id = endpoint_usage.served_entity_id\nLEFT JOIN system.access.workspaces_latest w ON served_entities.workspace_id = w.workspace_id\nWHERE \n DATE(endpoint_usage.request_time) BETWEEN :start_date AND :end_date\n),\n\n-- CTE to get top 10 users by usage quantity\ntop_users AS (\n  SELECT\n    account_id, \n    workspace_id,\n    endpoint_id,\n    requester_name_cleaned AS user,\n    SUM(total_token_count) AS total_tokens,\n    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT databricks_request_id) DESC) AS user_tokens_topN\n  FROM\n    endpoint_metadata\n  GROUP BY\n    account_id, \n    workspace_id,\n    endpoint_id,\n    requester_name_cleaned \n)\n\nSELECT em.*, \n  tu.user_tokens_topN\nFROM endpoint_metadata em\nINNER JOIN top_users tu\n  ON em.endpoint_id = tu.endpoint_id\n  AND em.account_id = tu.account_id\n  AND em.workspace_id = tu.workspace_id\n  AND em.requester_name_cleaned = tu.user",
     "parameters" : [ {
       "displayName" : "start_date",
       "keyword" : "start_date",
@@ -115,7 +115,7 @@
                 "abbreviation" : "compact",
                 "decimalPlaces" : {
                   "type" : "max",
-                  "places" : 1
+                  "places" : 0
                 }
               },
               "displayName" : "Sum of dollar_cost"
@@ -303,7 +303,7 @@
                 "abbreviation" : "compact",
                 "decimalPlaces" : {
                   "type" : "max",
-                  "places" : 1
+                  "places" : 0
                 }
               },
               "displayName" : "Sum of usage_quantity"
@@ -374,7 +374,7 @@
       },
       "position" : {
         "x" : 0,
-        "y" : 19,
+        "y" : 25,
         "width" : 2,
         "height" : 8
       }
@@ -693,7 +693,7 @@
       },
       "position" : {
         "x" : 2,
-        "y" : 19,
+        "y" : 25,
         "width" : 4,
         "height" : 8
       }
@@ -766,7 +766,7 @@
       },
       "position" : {
         "x" : 0,
-        "y" : 27,
+        "y" : 19,
         "width" : 6,
         "height" : 6
       }
@@ -984,17 +984,6 @@
       }
     }, {
       "widget" : {
-        "name" : "272b357a",
-        "textbox_spec" : "## TODO\n\n- Top-line Batch $DBU spent, PT $DBU, PPT $DBU\n"
-      },
-      "position" : {
-        "x" : 0,
-        "y" : 40,
-        "width" : 6,
-        "height" : 2
-      }
-    }, {
-      "widget" : {
         "name" : "1e5f729b",
         "queries" : [ {
           "name" : "main_query",
@@ -1105,18 +1094,27 @@
                   "by" : "y-reversed"
                 }
               },
+              "axis" : {
+                "hideTitle" : true
+              },
               "displayName" : "Function Name"
             },
             "y" : {
               "fieldName" : "count(ai_function_name)",
               "scale" : {
-                "type" : "quantitative"
+                "type" : "quantitative",
+                "fn" : {
+                  "type" : "symlog"
+                }
+              },
+              "axis" : {
+                "hideTitle" : true
               },
               "displayName" : "Number of Queries"
             }
           },
           "frame" : {
-            "title" : "Histogram of ai_function_name",
+            "title" : "AI Function Queries Breakdown",
             "showTitle" : true
           }
         }
@@ -1156,7 +1154,7 @@
                 "abbreviation" : "compact",
                 "decimalPlaces" : {
                   "type" : "max",
-                  "places" : 1
+                  "places" : 0
                 }
               },
               "displayName" : "Sum of dollar_cost"
@@ -1204,7 +1202,7 @@
                 "abbreviation" : "compact",
                 "decimalPlaces" : {
                   "type" : "max",
-                  "places" : 1
+                  "places" : 0
                 }
               },
               "displayName" : "Sum of dollar_cost"
@@ -1251,7 +1249,7 @@
                 "abbreviation" : "compact",
                 "decimalPlaces" : {
                   "type" : "max",
-                  "places" : 1
+                  "places" : 0
                 }
               },
               "displayName" : "Sum of dollar_cost"
@@ -1695,5 +1693,8 @@
       }
     } ],
     "pageType" : "PAGE_TYPE_CANVAS"
-  } ]
+  } ],
+  "uiSettings" : {
+    "theme" : { }
+  }
 }
